@@ -11,6 +11,7 @@ right boundary, giving a tridiagonal linear system A*N = b.
 """
 
 import numpy as np
+import scipy.sparse as sp
 from scipy.linalg import solve_banded
 
 from fp_smol.flux import sg_face_coefficients, face_average
@@ -37,27 +38,19 @@ def settling_loss_rate(xc, C_stk, h):
     return (C_stk / h) * np.asarray(xc, dtype=float)
 
 
-def assemble_steady_system(grid, Ax_c, D_x, lam, Jinj):
+def _build_diagonals(grid, Ax_c, D_x, lam, Jinj):
     """
-    Assemble the tridiagonal steady FV system A*N = b, in banded form.
+    Build the main/lower/upper diagonals and RHS for the steady FV system.
 
-    Parameters
-    ----------
-    grid : Grid
-        Grid object from fp_smol.grid.make_grid.
-    Ax_c : ndarray, shape (Ncells,)
-        Drift at cell centers, m^2/s.
-    D_x : float
-        Diffusivity, m^4/s.
-    lam : ndarray, shape (Ncells,)
-        Settling loss rate at cell centers, 1/s.
-    Jinj : float
-        Injection flux at the left boundary.
+    Shared by both the banded (direct steady solve) and sparse (reused
+    for time-stepping) system assembly below.
 
     Returns
     -------
-    ab : ndarray, shape (3, Ncells)
-        Banded-matrix representation for scipy.linalg.solve_banded.
+    main, lower, upper : ndarray, shape (Ncells,)
+        Diagonal entries. lower[i] multiplies N_{i-1} in row i;
+        upper[i] multiplies N_{i+1} in row i. lower[0] and upper[-1]
+        are unused (zero).
     b : ndarray, shape (Ncells,)
         Right-hand side.
     """
@@ -68,8 +61,8 @@ def assemble_steady_system(grid, Ax_c, D_x, lam, Jinj):
     alpha_face, beta_face = sg_face_coefficients(Ax_face, dx, D_x)
 
     main = np.zeros(Ncells)
-    lower = np.zeros(Ncells)  # lower[i] multiplies N_{i-1} in row i
-    upper = np.zeros(Ncells)  # upper[i] multiplies N_{i+1} in row i
+    lower = np.zeros(Ncells)
+    upper = np.zeros(Ncells)
     b = np.zeros(Ncells)
 
     # Row 0: J_{3/2} - Jinj + lambda_0 * N_0 * dx = 0
@@ -87,14 +80,59 @@ def assemble_steady_system(grid, Ax_c, D_x, lam, Jinj):
     lower[Ncells - 1] = -alpha_face[Ncells - 2]
     main[Ncells - 1] = -beta_face[Ncells - 2] + lam[Ncells - 1] * dx
 
-    # Banded storage for solve_banded: row 0 = superdiagonal (shifted),
-    # row 1 = main diagonal, row 2 = subdiagonal (shifted)
+    return main, lower, upper, b
+
+
+def assemble_steady_system(grid, Ax_c, D_x, lam, Jinj):
+    """
+    Assemble the tridiagonal steady FV system A*N = b, in banded form
+    for scipy.linalg.solve_banded.
+
+    Parameters
+    ----------
+    grid : Grid
+    Ax_c : ndarray, shape (Ncells,)
+    D_x : float
+    lam : ndarray, shape (Ncells,)
+    Jinj : float
+
+    Returns
+    -------
+    ab : ndarray, shape (3, Ncells)
+    b : ndarray, shape (Ncells,)
+    """
+    Ncells = grid.Ncells
+    main, lower, upper, b = _build_diagonals(grid, Ax_c, D_x, lam, Jinj)
+
     ab = np.zeros((3, Ncells))
     ab[0, 1:] = upper[:-1]
     ab[1, :] = main
     ab[2, :-1] = lower[1:]
 
     return ab, b
+
+
+def assemble_steady_system_sparse(grid, Ax_c, D_x, lam, Jinj):
+    """
+    Assemble the same tridiagonal steady FV system A*N = b, as a sparse
+    CSC matrix. Used by the time-dependent solver, where the matrix is
+    reused (factored once) across many timesteps.
+
+    Returns
+    -------
+    A : scipy.sparse.csc_matrix, shape (Ncells, Ncells)
+    b : ndarray, shape (Ncells,)
+    """
+    Ncells = grid.Ncells
+    main, lower, upper, b = _build_diagonals(grid, Ax_c, D_x, lam, Jinj)
+
+    A = sp.diags(
+        [lower[1:], main, upper[:-1]],
+        offsets=[-1, 0, 1],
+        format="csc",
+    )
+
+    return A, b
 
 
 def solve_steady(grid, Ax_c, D_x, lam, Jinj):
